@@ -1,0 +1,197 @@
+package com.example.economybank;
+
+import net.milkbowl.vault.economy.Economy;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.Statistic;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.RegisteredServiceProvider;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+
+public class EconomyBank extends JavaPlugin implements CommandExecutor {
+
+    private static Economy econ = null;
+    private final Map<UUID, Long> lastInterestPlaytime = new HashMap<>();
+
+    private File dataFile;
+    private FileConfiguration dataConfig;
+
+    private double baselineWealth;
+    private double baseInterestRate;
+    private double minInterestRate;
+    private double maxInterestRate;
+    private long requiredPlaytimeTicks;
+    private long economyUpdateTicks;
+
+    private double currentAverageWealth = 10000.0;
+    private double currentEffectiveInterestRate = 0.02;
+
+    @Override
+    public void onEnable() {
+        if (!setupEconomy()) {
+            getLogger().severe("Vault dependency missing or no Economy provider found! Disabling plugin.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
+        saveDefaultConfig();
+        loadConfigValues();
+
+        setupDataFile();
+        loadPlaytimeData();
+
+        Objects.requireNonNull(getCommand("interest")).setExecutor(this);
+
+        if (Bukkit.getPluginManager().isPluginEnabled("EconomyShopGUI") || 
+            Bukkit.getPluginManager().isPluginEnabled("EconomyShopGUI-Premium")) {
+            getLogger().info("Successfully connected to EconomyShopGUI.");
+        }
+
+        startPlaytimeInterestTask();
+        startEconomyAdjustmentTask();
+    }
+
+    @Override
+    public void onDisable() {
+        savePlaytimeData();
+    }
+
+    private boolean setupEconomy() {
+        if (getServer().getPluginManager().getPlugin("Vault") == null) return false;
+        RegisteredServiceProvider<Economy> rsp = getServer().getServicesManager().getRegistration(Economy.class);
+        if (rsp == null) return false;
+        econ = rsp.getProvider();
+        return econ != null;
+    }
+
+    private void loadConfigValues() {
+        FileConfiguration config = getConfig();
+        this.baselineWealth = config.getDouble("baseline-wealth", 10000.0);
+        this.baseInterestRate = config.getDouble("base-interest-rate", 0.02);
+        this.minInterestRate = config.getDouble("min-interest-rate", 0.005);
+        this.maxInterestRate = config.getDouble("max-interest-rate", 0.05);
+
+        long playtimeHours = config.getLong("required-playtime-hours", 24);
+        this.requiredPlaytimeTicks = playtimeHours * 3600L * 20L;
+
+        long updateHours = config.getLong("economy-update-interval-hours", 24);
+        this.economyUpdateTicks = updateHours * 3600L * 20L;
+    }
+
+    // --- Data Storage ---
+    private void setupDataFile() {
+        dataFile = new File(getDataFolder(), "playtime_data.yml");
+        if (!dataFile.exists()) {
+            try {
+                getDataFolder().mkdirs();
+                dataFile.createNewFile();
+            } catch (IOException e) {
+                getLogger().severe("Could not create playtime_data.yml!");
+            }
+        }
+        dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+    }
+
+    private void loadPlaytimeData() {
+        if (dataConfig.contains("players")) {
+            for (String uuidStr : Objects.requireNonNull(dataConfig.getConfigurationSection("players")).getKeys(false)) {
+                UUID uuid = UUID.fromString(uuidStr);
+                lastInterestPlaytime.put(uuid, dataConfig.getLong("players." + uuidStr + ".last-playtime", 0L));
+            }
+        }
+    }
+
+    private void savePlaytimeData() {
+        for (Map.Entry<UUID, Long> entry : lastInterestPlaytime.entrySet()) {
+            dataConfig.set("players." + entry.getKey().toString() + ".last-playtime", entry.getValue());
+        }
+        try {
+            dataConfig.save(dataFile);
+        } catch (IOException e) {
+            getLogger().severe("Could not save player playtime data to playtime_data.yml!");
+        }
+    }
+
+    // --- Outlier Removal (Interquartile Range) ---
+    public double calculateTrimmedAverageWealth() {
+        List<Double> balances = new ArrayList<>();
+        for (OfflinePlayer player : Bukkit.getOfflinePlayers()) {
+            double bal = econ.getBalance(player);
+            if (bal >= 0) {
+                balances.add(bal);
+            }
+        }
+
+        if (balances.isEmpty()) return baselineWealth;
+        if (balances.size() < 4) {
+            double sum = 0;
+            for (double b : balances) sum += b;
+            return sum / balances.size();
+        }
+
+        Collections.sort(balances);
+
+        double q1 = getPercentile(balances, 25);
+        double q3 = getPercentile(balances, 75);
+        double iqr = q3 - q1;
+        double lowerBound = q1 - (1.5 * iqr);
+        double upperBound = q3 + (1.5 * iqr);
+
+        List<Double> filtered = new ArrayList<>();
+        for (double b : balances) {
+            if (b >= lowerBound && b <= upperBound) {
+                filtered.add(b);
+            }
+        }
+
+        if (filtered.isEmpty()) return baselineWealth;
+
+        double sum = 0;
+        for (double val : filtered) sum += val;
+        return sum / filtered.size();
+    }
+
+    private double getPercentile(List<Double> sortedList, double percentile) {
+        int index = (int) Math.ceil((percentile / 100.0) * sortedList.size()) - 1;
+        index = Math.max(0, Math.min(index, sortedList.size() - 1));
+        return sortedList.get(index);
+    }
+
+    // --- 0.5:1 Price Scaling Engine ---
+    private void startEconomyAdjustmentTask() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                recalculateEconomy();
+            }
+        }.runTaskTimer(this, 100L, economyUpdateTicks);
+    }
+
+    public void recalculateEconomy() {
+        this.currentAverageWealth = calculateTrimmedAverageWealth();
+
+        // Raw wealth ratio (e.g., $11,000 / $10,000 = 1.10 -> +10% wealth)
+        double rawWealthRatio = Math.max(0.01, currentAverageWealth / baselineWealth);
+        double wealthPercentageShift = (rawWealthRatio - 1.0) * 100.0;
+
+        // Apply 0.5x scaling (e.g., +10% wealth shift -> +5% price shift)
+        double pricePercentageShift = wealthPercentageShift * 0.5;
+        double priceMultiplier = Math.max(0.01, 1.0 + (pricePercentageShift / 100.0));
+
+        // Counter-inflationary interest adjustment based on wealth ratio
+        double targetInterest = baseInterestRate / rawWealthRatio;
+        this.currentEffectiveInterestRate = Math.max(minInterestRate, Math.min(maxInterestRate, targetInterest));
+
+        getLogger().info(String
