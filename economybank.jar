@@ -4,6 +4,7 @@ import net.milkbowl.vault.economy.Economy;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
+import org.bukkit.Statistic;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -28,12 +29,14 @@ public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor
 
     private static Economy econ = null;
     private final Map<UUID, Double> bankBalances = new HashMap<>();
+    private final Map<UUID, Long> lastInterestPlaytime = new HashMap<>();
+
     private File bankDataFile;
     private FileConfiguration bankData;
 
     private double interestRate;
     private double taxRate;
-    private long interestIntervalTicks;
+    private long requiredPlaytimeTicks; // 24 hours = 1,728,000 ticks
 
     @Override
     public void onEnable() {
@@ -43,11 +46,9 @@ public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor
             return;
         }
 
-        // Generates plugins/EconomyBank/config.yml from src/main/resources/config.yml if missing
         saveDefaultConfig();
         loadConfigValues();
 
-        // Setup custom bankdata.yml file
         setupBankDataFile();
         loadBankData();
 
@@ -59,7 +60,7 @@ public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor
             getLogger().info("Successfully connected with EconomyShopGUI ecosystem.");
         }
 
-        startInterestTask();
+        startPlaytimeInterestTask();
     }
 
     @Override
@@ -79,8 +80,8 @@ public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor
         FileConfiguration config = getConfig();
         this.taxRate = config.getDouble("tax-rate", 0.05);
         this.interestRate = config.getDouble("interest-rate", 0.02);
-        long seconds = config.getLong("interest-interval-seconds", 3600);
-        this.interestIntervalTicks = seconds * 20L;
+        long hours = config.getLong("required-playtime-hours", 24);
+        this.requiredPlaytimeTicks = hours * 3600L * 20L;
     }
 
     // --- Bank Data File Management ---
@@ -100,14 +101,18 @@ public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor
     private void loadBankData() {
         if (bankData.contains("bank")) {
             for (String uuidStr : Objects.requireNonNull(bankData.getConfigurationSection("bank")).getKeys(false)) {
-                bankBalances.put(UUID.fromString(uuidStr), bankData.getDouble("bank." + uuidStr));
+                UUID uuid = UUID.fromString(uuidStr);
+                bankBalances.put(uuid, bankData.getDouble("bank." + uuidStr + ".balance", 0.0));
+                lastInterestPlaytime.put(uuid, bankData.getLong("bank." + uuidStr + ".last-playtime", 0L));
             }
         }
     }
 
     private void saveBankData() {
-        for (Map.Entry<UUID, Double> entry : bankBalances.entrySet()) {
-            bankData.set("bank." + entry.getKey().toString(), entry.getValue());
+        for (UUID uuid : bankBalances.keySet()) {
+            String path = "bank." + uuid.toString();
+            bankData.set(path + ".balance", bankBalances.get(uuid));
+            bankData.set(path + ".last-playtime", lastInterestPlaytime.getOrDefault(uuid, 0L));
         }
         try {
             bankData.save(bankDataFile);
@@ -116,26 +121,36 @@ public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor
         }
     }
 
-    // --- Automated Interest Scheduler ---
-    private void startInterestTask() {
+    // --- Playtime-Based Interest Task ---
+    private void startPlaytimeInterestTask() {
+        // Runs every minute (1200 ticks) to check online player playtime milestones
         new BukkitRunnable() {
             @Override
             public void run() {
-                for (Map.Entry<UUID, Double> entry : bankBalances.entrySet()) {
-                    double current = entry.getValue();
-                    if (current > 0) {
-                        double interest = current * interestRate;
-                        bankBalances.put(entry.getKey(), current + interest);
+                for (Player player : Bukkit.getOnlinePlayers()) {
+                    UUID id = player.getUniqueId();
+                    long currentPlaytime = player.getStatistic(Statistic.PLAY_ONE_MINUTE);
 
-                        Player p = Bukkit.getPlayer(entry.getKey());
-                        if (p != null && p.isOnline()) {
-                            p.sendMessage(ChatColor.GREEN + "[Bank] Interest payout received: $" + String.format("%.2f", interest));
+                    if (!lastInterestPlaytime.containsKey(id)) {
+                        lastInterestPlaytime.put(id, currentPlaytime);
+                        continue;
+                    }
+
+                    long lastPlaytime = lastInterestPlaytime.get(id);
+                    if (currentPlaytime - lastPlaytime >= requiredPlaytimeTicks) {
+                        double bankAcc = bankBalances.getOrDefault(id, 0.0);
+                        if (bankAcc > 0) {
+                            double interest = bankAcc * interestRate;
+                            bankBalances.put(id, bankAcc + interest);
+                            player.sendMessage(ChatColor.GREEN + "[Bank] Earned $" + String.format("%.2f", interest) + 
+                                    " (2% interest) for playing 24 hours!");
                         }
+                        lastInterestPlaytime.put(id, currentPlaytime);
+                        saveBankData();
                     }
                 }
-                saveBankData();
             }
-        }.runTaskTimer(this, interestIntervalTicks, interestIntervalTicks);
+        }.runTaskTimer(this, 1200L, 1200L);
     }
 
     // --- Commands & Bank GUI System ---
@@ -154,11 +169,19 @@ public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor
 
         double wallet = econ.getBalance(player);
         double bankAcc = bankBalances.getOrDefault(player.getUniqueId(), 0.0);
+        
+        long currentPlaytime = player.getStatistic(Statistic.PLAY_ONE_MINUTE);
+        long lastPlaytime = lastInterestPlaytime.getOrDefault(player.getUniqueId(), currentPlaytime);
+        long progressTicks = currentPlaytime - lastPlaytime;
+        long remainingSeconds = Math.max(0, (requiredPlaytimeTicks - progressTicks) / 20);
+        long hoursRemaining = remainingSeconds / 3600;
+        long minsRemaining = (remainingSeconds % 3600) / 60;
 
         // Info Item
         gui.setItem(4, createGuiItem(Material.EMERALD, ChatColor.GREEN + "Balance Summary",
                 ChatColor.GRAY + "Wallet: " + ChatColor.YELLOW + "$" + String.format("%.2f", wallet),
-                ChatColor.GRAY + "Bank: " + ChatColor.GOLD + "$" + String.format("%.2f", bankAcc)));
+                ChatColor.GRAY + "Bank: " + ChatColor.GOLD + "$" + String.format("%.2f", bankAcc),
+                ChatColor.GRAY + "Next Interest Payout: " + ChatColor.AQUA + hoursRemaining + "h " + minsRemaining + "m playtime left"));
 
         // Deposit 100
         gui.setItem(11, createGuiItem(Material.CHEST, ChatColor.GREEN + "Deposit $100",
@@ -226,24 +249,4 @@ public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor
         econ.withdrawPlayer(player, amount);
         bankBalances.put(player.getUniqueId(), bankBalances.getOrDefault(player.getUniqueId(), 0.0) + netDeposit);
 
-        player.sendMessage(ChatColor.GREEN + "Deposited $" + String.format("%.2f", netDeposit) + 
-                " into your bank. (Tax paid: $" + String.format("%.2f", tax) + ")");
-    }
-
-    private void processWithdraw(Player player, double amount) {
-        double bankAcc = bankBalances.getOrDefault(player.getUniqueId(), 0.0);
-        if (amount <= 0 || bankAcc < amount) {
-            player.sendMessage(ChatColor.RED + "You don't have enough money in your bank!");
-            return;
-        }
-
-        double tax = amount * taxRate;
-        double netWithdraw = amount - tax;
-
-        bankBalances.put(player.getUniqueId(), bankAcc - amount);
-        econ.depositPlayer(player, netWithdraw);
-
-        player.sendMessage(ChatColor.YELLOW + "Withdrew $" + String.format("%.2f", netWithdraw) + 
-                " into your wallet. (Tax paid: $" + String.format("%.2f", tax) + ")");
-    }
-}
+        player.sendMessage(ChatColor.GREEN + "Deposited
