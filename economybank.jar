@@ -1,0 +1,249 @@
+package com.example.economybank;
+
+import net.milkbowl.vault.economy.Economy;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.Material;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.RegisteredServiceProvider;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+
+public class EconomyBank extends JavaPlugin implements Listener, CommandExecutor {
+
+    private static Economy econ = null;
+    private final Map<UUID, Double> bankBalances = new HashMap<>();
+    private File bankDataFile;
+    private FileConfiguration bankData;
+
+    private double interestRate;
+    private double taxRate;
+    private long interestIntervalTicks;
+
+    @Override
+    public void onEnable() {
+        if (!setupEconomy()) {
+            getLogger().severe("Vault dependency missing or no Economy provider found! Disabling plugin.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
+        // Generates plugins/EconomyBank/config.yml from src/main/resources/config.yml if missing
+        saveDefaultConfig();
+        loadConfigValues();
+
+        // Setup custom bankdata.yml file
+        setupBankDataFile();
+        loadBankData();
+
+        getServer().getPluginManager().registerEvents(this, this);
+        Objects.requireNonNull(getCommand("bank")).setExecutor(this);
+
+        if (Bukkit.getPluginManager().isPluginEnabled("EconomyShopGUI") || 
+            Bukkit.getPluginManager().isPluginEnabled("EconomyShopGUI-Premium")) {
+            getLogger().info("Successfully connected with EconomyShopGUI ecosystem.");
+        }
+
+        startInterestTask();
+    }
+
+    @Override
+    public void onDisable() {
+        saveBankData();
+    }
+
+    private boolean setupEconomy() {
+        if (getServer().getPluginManager().getPlugin("Vault") == null) return false;
+        RegisteredServiceProvider<Economy> rsp = getServer().getServicesManager().getRegistration(Economy.class);
+        if (rsp == null) return false;
+        econ = rsp.getProvider();
+        return econ != null;
+    }
+
+    private void loadConfigValues() {
+        FileConfiguration config = getConfig();
+        this.taxRate = config.getDouble("tax-rate", 0.05);
+        this.interestRate = config.getDouble("interest-rate", 0.02);
+        long seconds = config.getLong("interest-interval-seconds", 3600);
+        this.interestIntervalTicks = seconds * 20L;
+    }
+
+    // --- Bank Data File Management ---
+    private void setupBankDataFile() {
+        bankDataFile = new File(getDataFolder(), "bankdata.yml");
+        if (!bankDataFile.exists()) {
+            try {
+                getDataFolder().mkdirs();
+                bankDataFile.createNewFile();
+            } catch (IOException e) {
+                getLogger().severe("Could not create bankdata.yml!");
+            }
+        }
+        bankData = YamlConfiguration.loadConfiguration(bankDataFile);
+    }
+
+    private void loadBankData() {
+        if (bankData.contains("bank")) {
+            for (String uuidStr : Objects.requireNonNull(bankData.getConfigurationSection("bank")).getKeys(false)) {
+                bankBalances.put(UUID.fromString(uuidStr), bankData.getDouble("bank." + uuidStr));
+            }
+        }
+    }
+
+    private void saveBankData() {
+        for (Map.Entry<UUID, Double> entry : bankBalances.entrySet()) {
+            bankData.set("bank." + entry.getKey().toString(), entry.getValue());
+        }
+        try {
+            bankData.save(bankDataFile);
+        } catch (IOException e) {
+            getLogger().severe("Could not save player bank data to bankdata.yml!");
+        }
+    }
+
+    // --- Automated Interest Scheduler ---
+    private void startInterestTask() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                for (Map.Entry<UUID, Double> entry : bankBalances.entrySet()) {
+                    double current = entry.getValue();
+                    if (current > 0) {
+                        double interest = current * interestRate;
+                        bankBalances.put(entry.getKey(), current + interest);
+
+                        Player p = Bukkit.getPlayer(entry.getKey());
+                        if (p != null && p.isOnline()) {
+                            p.sendMessage(ChatColor.GREEN + "[Bank] Interest payout received: $" + String.format("%.2f", interest));
+                        }
+                    }
+                }
+                saveBankData();
+            }
+        }.runTaskTimer(this, interestIntervalTicks, interestIntervalTicks);
+    }
+
+    // --- Commands & Bank GUI System ---
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("Only players can open the bank GUI.");
+            return true;
+        }
+        openBankGUI(player);
+        return true;
+    }
+
+    public void openBankGUI(Player player) {
+        Inventory gui = Bukkit.createInventory(null, 27, ChatColor.GOLD + "Bank Account");
+
+        double wallet = econ.getBalance(player);
+        double bankAcc = bankBalances.getOrDefault(player.getUniqueId(), 0.0);
+
+        // Info Item
+        gui.setItem(4, createGuiItem(Material.EMERALD, ChatColor.GREEN + "Balance Summary",
+                ChatColor.GRAY + "Wallet: " + ChatColor.YELLOW + "$" + String.format("%.2f", wallet),
+                ChatColor.GRAY + "Bank: " + ChatColor.GOLD + "$" + String.format("%.2f", bankAcc)));
+
+        // Deposit 100
+        gui.setItem(11, createGuiItem(Material.CHEST, ChatColor.GREEN + "Deposit $100",
+                ChatColor.GRAY + "Tax: " + String.format("%.1f", taxRate * 100) + "%"));
+
+        // Deposit All
+        gui.setItem(12, createGuiItem(Material.ENDER_CHEST, ChatColor.GREEN + "Deposit All",
+                ChatColor.GRAY + "Tax: " + String.format("%.1f", taxRate * 100) + "%"));
+
+        // Withdraw 100
+        gui.setItem(14, createGuiItem(Material.DISPENSER, ChatColor.RED + "Withdraw $100",
+                ChatColor.GRAY + "Tax: " + String.format("%.1f", taxRate * 100) + "%"));
+
+        // Withdraw All
+        gui.setItem(15, createGuiItem(Material.HOPPER, ChatColor.RED + "Withdraw All",
+                ChatColor.GRAY + "Tax: " + String.format("%.1f", taxRate * 100) + "%"));
+
+        player.openInventory(gui);
+    }
+
+    private ItemStack createGuiItem(Material material, String name, String... lore) {
+        ItemStack item = new ItemStack(material);
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            meta.setDisplayName(name);
+            meta.setLore(Arrays.asList(lore));
+            item.setItemMeta(meta);
+        }
+        return item;
+    }
+
+    // --- GUI Click Handler ---
+    @EventHandler
+    public void onInventoryClick(InventoryClickEvent event) {
+        if (!event.getView().getTitle().equals(ChatColor.GOLD + "Bank Account")) return;
+
+        event.setCancelled(true);
+        if (!(event.getWhoClicked() instanceof Player player)) return;
+        if (event.getCurrentItem() == null || event.getCurrentItem().getType() == Material.AIR) return;
+
+        UUID id = player.getUniqueId();
+        double wallet = econ.getBalance(player);
+        double bankAcc = bankBalances.getOrDefault(id, 0.0);
+
+        switch (event.getSlot()) {
+            case 11 -> processDeposit(player, 100.0);
+            case 12 -> processDeposit(player, wallet);
+            case 14 -> processWithdraw(player, 100.0);
+            case 15 -> processWithdraw(player, bankAcc);
+        }
+
+        openBankGUI(player);
+    }
+
+    private void processDeposit(Player player, double amount) {
+        double wallet = econ.getBalance(player);
+        if (amount <= 0 || wallet < amount) {
+            player.sendMessage(ChatColor.RED + "You don't have enough money in your wallet!");
+            return;
+        }
+
+        double tax = amount * taxRate;
+        double netDeposit = amount - tax;
+
+        econ.withdrawPlayer(player, amount);
+        bankBalances.put(player.getUniqueId(), bankBalances.getOrDefault(player.getUniqueId(), 0.0) + netDeposit);
+
+        player.sendMessage(ChatColor.GREEN + "Deposited $" + String.format("%.2f", netDeposit) + 
+                " into your bank. (Tax paid: $" + String.format("%.2f", tax) + ")");
+    }
+
+    private void processWithdraw(Player player, double amount) {
+        double bankAcc = bankBalances.getOrDefault(player.getUniqueId(), 0.0);
+        if (amount <= 0 || bankAcc < amount) {
+            player.sendMessage(ChatColor.RED + "You don't have enough money in your bank!");
+            return;
+        }
+
+        double tax = amount * taxRate;
+        double netWithdraw = amount - tax;
+
+        bankBalances.put(player.getUniqueId(), bankAcc - amount);
+        econ.depositPlayer(player, netWithdraw);
+
+        player.sendMessage(ChatColor.YELLOW + "Withdrew $" + String.format("%.2f", netWithdraw) + 
+                " into your wallet. (Tax paid: $" + String.format("%.2f", tax) + ")");
+    }
+}
